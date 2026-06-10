@@ -157,7 +157,12 @@ contract StrategyManager is
 
         // NOTE: Duplicate operator sets and slash ids will not revert, but will not be added.
         _pendingOperatorSets.add(operatorSet.key());
-        _pendingSlashIds[operatorSet.key()].add(slashId);
+        // Set the resolution block the first time this slashId is recorded for this operator set.
+        if (_pendingSlashIds[operatorSet.key()].add(slashId)) {
+            uint32 resolutionBlock = uint32(block.number) + SLASH_RESOLUTION_DELAY_BLOCKS;
+            _slashResolutionBlock[operatorSet.key()][slashId] = resolutionBlock;
+            emit SlashResolutionBlockSet(operatorSet, slashId, resolutionBlock);
+        }
 
         emit BurnOrRedistributableSharesIncreased(operatorSet, slashId, strategy, sharesToBurn);
     }
@@ -166,7 +171,10 @@ contract StrategyManager is
     function clearBurnOrRedistributableShares(
         OperatorSet calldata operatorSet,
         uint256 slashId
-    ) external nonReentrant returns (uint256[] memory) {
+    ) external onlyWhenNotPaused(PAUSED_BURNING_AND_REDISTRIBUTION) nonReentrant returns (uint256[] memory) {
+        // Pause/delay are checked once here; per-strategy iteration shares the same slashId resolution block.
+        require(block.number > _slashResolutionBlock[operatorSet.key()][slashId], SlashResolutionDelayNotElapsed());
+
         // Get the strategies to clear.
         address[] memory strategies = _burnOrRedistributableShares[operatorSet.key()][slashId].keys();
         uint256 length = strategies.length;
@@ -190,7 +198,8 @@ contract StrategyManager is
         OperatorSet calldata operatorSet,
         uint256 slashId,
         IStrategy strategy
-    ) external nonReentrant returns (uint256) {
+    ) external onlyWhenNotPaused(PAUSED_BURNING_AND_REDISTRIBUTION) nonReentrant returns (uint256) {
+        require(block.number > _slashResolutionBlock[operatorSet.key()][slashId], SlashResolutionDelayNotElapsed());
         return _clearBurnOrRedistributableShares({
             operatorSet: operatorSet,
             slashId: slashId,
@@ -202,7 +211,7 @@ contract StrategyManager is
     /// @inheritdoc IStrategyManager
     function burnShares(
         IStrategy strategy
-    ) external nonReentrant {
+    ) external onlyWhenNotPaused(PAUSED_BURNING_AND_REDISTRIBUTION) nonReentrant {
         (, uint256 sharesToBurn) = EnumerableMap.tryGet(burnableShares, address(strategy));
         EnumerableMap.remove(burnableShares, address(strategy));
         emit BurnableSharesDecreased(strategy, sharesToBurn);
@@ -384,6 +393,8 @@ contract StrategyManager is
     /// @param slashId The slash id to clear the shares for.
     /// @param strategy The strategy to clear the shares for.
     /// @param recipient The recipient to withdraw the shares to.
+    /// @dev Pause and slash-resolution-delay checks are enforced by the external callers
+    ///      (`clearBurnOrRedistributableShares` / `clearBurnOrRedistributableSharesByStrategy`).
     function _clearBurnOrRedistributableShares(
         OperatorSet calldata operatorSet,
         uint256 slashId,
@@ -410,12 +421,14 @@ contract StrategyManager is
             emit BurnOrRedistributableSharesDecreased(operatorSet, slashId, strategy, sharesToRemove);
         }
 
-        uint256 remainingStrategies = burnOrRedistributableShares.keys().length;
+        uint256 remainingStrategies = burnOrRedistributableShares.length();
 
         // If there are no more strategies to burn or redistribute...
         if (remainingStrategies == 0) {
             // Remove the slash id from the pending slash ids.
             _pendingSlashIds[operatorSet.key()].remove(slashId);
+            // Remove the slash resolution block for this slash id.
+            delete _slashResolutionBlock[operatorSet.key()][slashId];
 
             // If there are no more pending slash ids for this operator set, remove the operator set from the pending operator sets.
             if (_pendingSlashIds[operatorSet.key()].length() == 0) {
@@ -566,5 +579,13 @@ contract StrategyManager is
         OperatorSet calldata operatorSet
     ) external view returns (uint256[] memory) {
         return _pendingSlashIds[operatorSet.key()].values();
+    }
+
+    /// @inheritdoc IStrategyManager
+    function getSlashResolutionBlock(
+        OperatorSet calldata operatorSet,
+        uint256 slashId
+    ) external view returns (uint32) {
+        return _slashResolutionBlock[operatorSet.key()][slashId];
     }
 }
